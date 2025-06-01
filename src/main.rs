@@ -1,5 +1,5 @@
-use assets::{Asset, Assets, ConvertableRenderAsset, GpuAsset, ReloadableAsset};
-use std::{fs::read_to_string, os::unix::thread, path::Path, thread::sleep, time::Duration};
+use assets::{Assets, ConvertableRenderAsset, ReloadableAsset, RenderAsset};
+use std::{fmt::Write, fs::read_to_string, path::Path, thread::sleep, time::Duration};
 
 mod assets;
 mod handle;
@@ -11,10 +11,10 @@ fn main() {
         name: String::from("bro"),
         age: 12,
     });
-    let person2 = assets.load_from_disk::<Person>(Path::new("assets/alice.person"));
-    let person3 = assets.watch::<Person>(Path::new("assets/bob.person"));
-    let house1 = assets.watch::<House>(Path::new("assets/house1"));
-    let shader = assets.watch::<Shader>(Path::new("assets/shader"));
+    let person2 = assets.load_from_disk::<Person>(Path::new("assets/alice.person"), true, true);
+    let person3 = assets.load_from_disk::<Person>(Path::new("assets/bob.person"), true, false);
+    let house1 = assets.load_from_disk::<House>(Path::new("assets/house1"), true, true);
+    let shader = assets.load_from_disk::<Shader>(Path::new("assets/shader"), true, false);
 
     assets.get_mut(person1.clone());
 
@@ -22,18 +22,21 @@ fn main() {
         sleep(Duration::from_millis(1000));
 
         println!("shader: {:?}", assets.get(shader.clone()));
-        println!(
-            "shader gpu: {:?}",
-            assets.convert_mut::<GpuShader>(shader.clone())
-        );
-        let gpu_shader = assets.convert(shader.clone());
+        let gpu_shader = assets.convert(shader.clone(), &100);
         print_gpu_shader(gpu_shader);
 
-        assets.poll_reload();
+        println!("person2: {:?}", assets.get(person2.clone()));
+        assets.get_mut(person2.clone()).age += 1;
+        assets.get_mut(house1.clone()).price += 1;
+
+        assets.poll_serialize();
+        assets.poll_deserialize();
     }
 }
 
-fn print_gpu_shader(shader: &GpuShader) {}
+fn print_gpu_shader(shader: &GpuShader) {
+    println!("{:?}", shader)
+}
 
 #[derive(Debug)]
 struct Shader {
@@ -43,8 +46,12 @@ struct Shader {
 impl ReloadableAsset for Shader {
     fn load(path: &Path) -> Self {
         println!("reload shader");
-        let content = read_to_string(path).unwrap();
+        let content = read_to_string(path).expect("could not read shader from disk");
         Self { source: content }
+    }
+
+    fn write(&self, path: &Path) {
+        std::fs::write(path, &self.source).expect("could not write shader to disk");
     }
 }
 
@@ -53,14 +60,17 @@ struct GpuShader {
     module: u32, // handle
 }
 
-impl GpuAsset for GpuShader {}
+impl RenderAsset for GpuShader {}
 impl ConvertableRenderAsset for GpuShader {
     type SourceAsset = Shader;
+    type Params = u32;
 
-    fn convert(source: &Self::SourceAsset) -> Self {
+    fn convert(source: &Self::SourceAsset, params: &Self::Params) -> Self {
         println!("convert shader to gpu shader");
         let id = source.source.trim().parse::<u32>().unwrap();
-        Self { module: id }
+        Self {
+            module: id + *params,
+        }
     }
 }
 
@@ -78,6 +88,8 @@ impl ReloadableAsset for House {
         let price = price.parse::<u32>().unwrap();
         Self { price }
     }
+
+    fn write(&self, path: &Path) {}
 }
 
 #[derive(Debug)]
@@ -93,5 +105,12 @@ impl ReloadableAsset for Person {
         let name = split.next().unwrap().to_string();
         let age = split.next().unwrap().parse::<u32>().unwrap();
         Self { name, age }
+    }
+    fn write(&self, path: &Path) {
+        let mut output = String::new();
+        output.write_str(&self.name).unwrap();
+        output.write_char(' ').unwrap();
+        output.write_str(&self.age.to_string()).unwrap();
+        std::fs::write(path, output).expect("could not write to person");
     }
 }

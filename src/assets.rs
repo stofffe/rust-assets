@@ -144,6 +144,10 @@ impl Assets {
     }
 
     pub fn get_mut<T: Asset + 'static>(&mut self, handle: AssetHandle<T>) -> &mut T {
+        // invalidate gpu cache
+        self.gpu.remove(&handle.clone().to_handle());
+
+        // get value and convert to T
         self.cache
             .get_mut(&handle.to_handle())
             .and_then(|a| a.as_any_mut().downcast_mut::<T>())

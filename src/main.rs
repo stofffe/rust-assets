@@ -1,5 +1,7 @@
-use assets::{ArcHandle, Asset, Assets, ConvertableRenderAsset, RenderAsset};
-use std::{fmt::Write, fs::read_to_string, path::Path, sync::Arc, thread::sleep, time::Duration};
+use assets::{
+    ArcHandle, Asset, Assets, ConvertableRenderAsset, LoadableAsset, RenderAsset, WriteableAsset,
+};
+use std::{fmt::Write, fs::read_to_string, path::Path, thread::sleep, time::Duration};
 
 mod assets;
 mod handle;
@@ -52,7 +54,8 @@ struct Person {
     age: u32,
 }
 
-impl Asset for Person {
+impl Asset for Person {}
+impl LoadableAsset for Person {
     fn load(path: &Path) -> Self {
         let inp = read_to_string(path).unwrap();
         let mut split = inp.split_whitespace();
@@ -60,11 +63,8 @@ impl Asset for Person {
         let age = split.next().unwrap().parse::<u32>().unwrap();
         Self { name, age }
     }
-
-    fn reload(&mut self, path: &Path) {
-        *self = Self::load(path);
-    }
-
+}
+impl WriteableAsset for Person {
     fn write(&mut self, path: &Path) {
         let mut output = String::new();
         output.write_str(&self.name).unwrap();
@@ -79,17 +79,14 @@ struct Shader {
     source: String,
 }
 
-impl Asset for Shader {
+impl Asset for Shader {}
+impl LoadableAsset for Shader {
     fn load(path: &Path) -> Self {
-        println!("reload shader");
         let content = read_to_string(path).expect("could not read shader from disk");
         Self { source: content }
     }
-
-    fn reload(&mut self, path: &Path) {
-        *self = Self::load(path);
-    }
-
+}
+impl WriteableAsset for Shader {
     fn write(&mut self, path: &Path) {
         std::fs::write(path, &self.source).expect("could not write shader to disk");
     }

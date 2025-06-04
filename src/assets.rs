@@ -1,5 +1,5 @@
 use crate::handle::AssetHandle;
-use std::any;
+use std::any::TypeId;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::{
     any::Any,
@@ -12,21 +12,20 @@ use std::{
 
 pub type DynAsset = Box<dyn Asset>;
 pub type DynRenderAsset = ArcHandle<dyn Any + Send + Sync>;
+pub type DynAssetLoadFn = Box<dyn Fn(&Path) -> DynAsset>;
+pub type DynAssetWriteFn = Box<dyn Fn(&mut DynAsset, &Path)>;
 
-pub trait Asset: Any + Send + Sync {
-    fn load(path: &Path) -> Self
-    where
-        Self: Sized;
+pub trait Asset: Any + Send + Sync {}
 
-    fn reload(&mut self, _path: &Path) {
-        println!("[WARN]: trying to deserialize asset without implementing trait")
-    }
-    fn write(&mut self, _path: &Path) {
-        println!("[WARN]: trying to serialize asset without implementing trait")
-    }
+pub trait LoadableAsset {
+    fn load(path: &Path) -> Self;
+}
+pub trait WriteableAsset {
+    fn write(&mut self, _path: &Path);
 }
 
-pub trait RenderAsset: Any {} // might be able to remove and enforce with convert function
+pub trait RenderAsset: Any {}
+
 pub trait ConvertableRenderAsset: RenderAsset + Send + Sync {
     type SourceAsset: Asset;
     type Params;
@@ -34,40 +33,26 @@ pub trait ConvertableRenderAsset: RenderAsset + Send + Sync {
     fn convert(source: &Self::SourceAsset, params: &Self::Params) -> Self;
 }
 
-impl dyn Asset {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-// impl Arc<dyn RenderAsset> {}
-
-impl dyn RenderAsset {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
 pub struct Assets {
-    cache: HashMap<AssetHandle<DynAsset>, Option<DynAsset>>,
+    cache: HashMap<AssetHandle<DynAsset>, Option<DynAsset>>, // TODO: does this need to be option with new function system
     render_cache: HashMap<AssetHandle<DynAsset>, DynRenderAsset>,
 
     load_handles: HashMap<AssetHandle<DynAsset>, PathBuf>,
     load_dirty: HashSet<AssetHandle<DynAsset>>,
+
     // async loading
     load_sender: mpsc::Sender<(AssetHandle<DynAsset>, DynAsset)>,
     load_receiver: mpsc::Receiver<(AssetHandle<DynAsset>, DynAsset)>,
 
     // reloading
-    reload_handles: HashMap<PathBuf, AssetHandle<DynAsset>>,
+    reload_functions: HashMap<TypeId, DynAssetLoadFn>,
+    reload_handles: HashMap<PathBuf, AssetHandle<DynAsset>>, // TODO: support multiple assets with same path
     reload_watcher: notify_debouncer_mini::Debouncer<notify_debouncer_mini::notify::FsEventWatcher>,
     reload_receiver: mpsc::Receiver<PathBuf>,
     reload_sender: mpsc::Sender<PathBuf>,
+
+    // writing
+    write_functions: HashMap<TypeId, DynAssetWriteFn>,
 }
 
 impl Assets {
@@ -99,6 +84,9 @@ impl Assets {
             reload_handles: HashMap::new(),
             load_handles: HashMap::new(),
 
+            write_functions: HashMap::new(),
+
+            reload_functions: HashMap::new(),
             reload_receiver,
             reload_sender,
             reload_watcher,
@@ -153,7 +141,7 @@ impl Assets {
     // Reloading
     //
 
-    pub fn load_sync<T: Asset + 'static>(
+    pub fn load_sync<T: Asset + LoadableAsset + WriteableAsset + 'static>(
         &mut self,
         path: &Path,
         watch: bool,
@@ -169,6 +157,7 @@ impl Assets {
         );
 
         if watch {
+            // start watching path
             self.reload_watcher
                 .watcher()
                 .watch(
@@ -177,19 +166,39 @@ impl Assets {
                 )
                 .unwrap();
 
+            // map path to handle
             self.reload_handles
                 .insert(path.clone(), handle.clone().clone_typed::<DynAsset>());
+
+            // store reload function
+            self.reload_functions
+                .entry(TypeId::of::<T>())
+                .or_insert_with(|| Box::new(|path| Box::new(T::load(path))));
         }
 
         if write {
+            // map handle to path
             self.load_handles
                 .insert(handle.clone().clone_typed::<DynAsset>(), path.clone());
+
+            // store reload function
+            self.write_functions
+                .entry(TypeId::of::<T>())
+                .or_insert_with(|| {
+                    Box::new(|asset, path| {
+                        let typed = asset
+                            .as_any_mut()
+                            .downcast_mut::<T>()
+                            .expect("could not cast during write");
+                        typed.write(path);
+                    })
+                });
         }
 
         handle
     }
 
-    pub fn load_async<T: Asset + 'static>(
+    pub fn load_async<T: Asset + LoadableAsset + WriteableAsset + 'static>(
         &mut self,
         path: &Path,
         watch: bool,
@@ -216,6 +225,7 @@ impl Assets {
         });
 
         if watch {
+            // start watching path
             self.reload_watcher
                 .watcher()
                 .watch(
@@ -224,13 +234,33 @@ impl Assets {
                 )
                 .unwrap();
 
+            // map path to handle
             self.reload_handles
                 .insert(path.clone(), handle.clone().clone_typed::<DynAsset>());
+
+            // store reload function
+            self.reload_functions
+                .entry(TypeId::of::<T>())
+                .or_insert_with(|| Box::new(|path| Box::new(T::load(path))));
         }
 
         if write {
+            // map handle to path
             self.load_handles
                 .insert(handle.clone().clone_typed::<DynAsset>(), path.clone());
+
+            // store reload function
+            self.write_functions
+                .entry(TypeId::of::<T>())
+                .or_insert_with(|| {
+                    Box::new(|asset, path| {
+                        let typed = asset
+                            .as_any_mut()
+                            .downcast_mut::<T>()
+                            .expect("could not cast during write");
+                        typed.write(path);
+                    })
+                });
         }
 
         handle
@@ -248,9 +278,15 @@ impl Assets {
         for handle in self.load_dirty.drain() {
             if let Some(path) = self.load_handles.get(&handle) {
                 let asset = self.cache.get_mut(&handle).expect("invalid handle");
+
+                // write if loaded
                 if let Some(asset) = asset {
-                    asset.write(path);
-                    println!("write {:?}", path);
+                    let write_fn = self
+                        .write_functions
+                        .get(&handle.ty_id)
+                        .expect("could not get write fn");
+
+                    write_fn(asset, path);
                 }
             }
         }
@@ -259,13 +295,21 @@ impl Assets {
     // checks if any files changed and spawns a thread which reloads the data
     pub fn poll_reload(&mut self) {
         for path in self.reload_receiver.try_iter() {
-            let handle = self.reload_handles.get_mut(&path).unwrap();
+            if let Some(handle) = self.reload_handles.get_mut(&path) {
+                let asset = self.cache.get_mut(handle).expect("invalid handle");
 
-            let asset = self.cache.get_mut(handle).expect("invalid handle");
-            if let Some(asset) = asset {
-                asset.reload(&path);
-                println!("load {:?}", path);
-                self.render_cache.remove(handle);
+                if let Some(asset) = asset {
+                    println!("reload {:?}", path);
+
+                    let loader_fn = self
+                        .reload_functions
+                        .get(&handle.ty_id)
+                        .expect("could not get loader fn");
+                    *asset = loader_fn(&path);
+
+                    // invalidate render cache
+                    self.render_cache.remove(handle);
+                }
             }
         }
     }
@@ -303,6 +347,23 @@ impl Assets {
             .unwrap();
 
         any_handle.downcast::<G>()
+    }
+}
+
+impl dyn Asset {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+impl dyn RenderAsset {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

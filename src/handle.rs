@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, sync::atomic::AtomicU64};
+use std::{any::TypeId, marker::PhantomData, sync::atomic::AtomicU64};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -7,6 +7,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 pub struct AssetHandle<T: 'static> {
     pub(crate) id: u64,
     pub(crate) ty: PhantomData<T>,
+    pub(crate) ty_id: TypeId,
 }
 
 impl<T: 'static> AssetHandle<T> {
@@ -15,6 +16,7 @@ impl<T: 'static> AssetHandle<T> {
         Self {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             ty: PhantomData,
+            ty_id: TypeId::of::<T>(),
         }
     }
 
@@ -27,6 +29,7 @@ impl<T: 'static> AssetHandle<T> {
         AssetHandle::<G> {
             id: self.id,
             ty: PhantomData,
+            ty_id: TypeId::of::<T>(),
         }
     }
 }
@@ -50,6 +53,7 @@ impl<T: 'static> Clone for AssetHandle<T> {
         Self {
             id: self.id,
             ty: PhantomData,
+            ty_id: TypeId::of::<T>(),
         }
     }
 }

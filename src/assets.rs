@@ -145,7 +145,45 @@ impl Assets {
     // Reloading
     //
 
-    pub fn load_sync<T: Asset + LoadableAsset + WriteableAsset + 'static>(
+    pub fn load<T: Asset + LoadableAsset + WriteableAsset>(
+        &mut self,
+        path: &Path,
+        watch: bool,
+        write: bool,
+        sync: bool,
+    ) -> AssetHandle<T> {
+        let path = fs::canonicalize(path).unwrap();
+        let handle = AssetHandle::<T>::new();
+
+        if sync {
+            let data = T::load(&path);
+            self.cache
+                .insert(handle.clone().clone_typed::<DynAsset>(), Box::new(data));
+        } else {
+            let path_clone = path.clone();
+            let handle_clone = handle.clone();
+            let loaded_sender_clone = self.load_sender.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20000));
+                let data = T::load(&path_clone);
+                loaded_sender_clone
+                    .send((handle_clone.clone_typed::<DynAsset>(), Box::new(data)))
+                    .expect("could not send");
+            });
+        }
+
+        if watch {
+            self.watch(handle.clone(), path.clone());
+        }
+
+        if write {
+            self.write(handle.clone(), path.clone());
+        }
+
+        handle
+    }
+
+    pub fn load_sync<T: Asset + LoadableAsset + WriteableAsset>(
         &mut self,
         path: &Path,
         watch: bool,
@@ -159,49 +197,17 @@ impl Assets {
             .insert(handle.clone().clone_typed::<DynAsset>(), Box::new(data));
 
         if watch {
-            // start watching path
-            self.reload_watcher
-                .watcher()
-                .watch(
-                    &path,
-                    notify_debouncer_mini::notify::RecursiveMode::Recursive,
-                )
-                .unwrap();
-
-            // map path to handle
-
-            let handles = self.reload_handles.entry(path.clone()).or_default();
-            handles.push(handle.clone().clone_typed::<DynAsset>());
-
-            // store reload function
-            self.reload_functions
-                .entry(TypeId::of::<T>())
-                .or_insert_with(|| Box::new(|path| Box::new(T::load(path))));
+            self.watch(handle.clone(), path.clone());
         }
 
         if write {
-            // map handle to path
-            self.load_handles
-                .insert(handle.clone().clone_typed::<DynAsset>(), path.clone());
-
-            // store reload function
-            self.write_functions
-                .entry(TypeId::of::<T>())
-                .or_insert_with(|| {
-                    Box::new(|asset, path| {
-                        let typed = asset
-                            .as_any_mut()
-                            .downcast_mut::<T>()
-                            .expect("could not cast during write");
-                        typed.write(path);
-                    })
-                });
+            self.write(handle.clone(), path.clone());
         }
 
         handle
     }
 
-    pub fn load_async<T: Asset + LoadableAsset + WriteableAsset + 'static>(
+    pub fn load_async<T: Asset + LoadableAsset + WriteableAsset>(
         &mut self,
         path: &Path,
         watch: bool,
@@ -216,7 +222,7 @@ impl Assets {
         let loaded_sender_clone = self.load_sender.clone();
 
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(2000)); // TODO: remove debug
+            std::thread::sleep(Duration::from_millis(5000)); // TODO: remove debug
             let data = T::load(&path_clone);
             loaded_sender_clone
                 .send((handle_clone.clone_typed::<DynAsset>(), Box::new(data)))
@@ -224,46 +230,88 @@ impl Assets {
         });
 
         if watch {
-            // start watching path
-            self.reload_watcher
-                .watcher()
-                .watch(
-                    &path,
-                    notify_debouncer_mini::notify::RecursiveMode::Recursive,
-                )
-                .unwrap();
-
-            // map path to handle
-            let handles = self.reload_handles.entry(path.clone()).or_default();
-            handles.push(handle.clone().clone_typed::<DynAsset>());
-
-            // store reload function
-            self.reload_functions
-                .entry(TypeId::of::<T>())
-                .or_insert_with(|| Box::new(|path| Box::new(T::load(path))));
+            self.watch(handle.clone(), path.clone());
         }
 
         if write {
-            // map handle to path
-            self.load_handles
-                .insert(handle.clone().clone_typed::<DynAsset>(), path.clone());
-
-            // store reload function
-            self.write_functions
-                .entry(TypeId::of::<T>())
-                .or_insert_with(|| {
-                    Box::new(|asset, path| {
-                        let typed = asset
-                            .as_any_mut()
-                            .downcast_mut::<T>()
-                            .expect("could not cast during write");
-                        typed.write(path);
-                    })
-                });
+            self.write(handle.clone(), path.clone());
         }
 
         handle
     }
+
+    fn watch<T: Asset + LoadableAsset>(&mut self, handle: AssetHandle<T>, path: PathBuf) {
+        // start watching path
+        self.reload_watcher
+            .watcher()
+            .watch(
+                &path,
+                notify_debouncer_mini::notify::RecursiveMode::Recursive,
+            )
+            .unwrap();
+
+        // map path to handle
+        let handles = self.reload_handles.entry(path).or_default();
+        handles.push(handle.clone_typed::<DynAsset>());
+
+        // store reload function
+        self.reload_functions
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(|path| Box::new(T::load(path))));
+    }
+    fn write<T: Asset + WriteableAsset>(&mut self, handle: AssetHandle<T>, path: PathBuf) {
+        // map handle to path
+        self.load_handles
+            .insert(handle.clone_typed::<DynAsset>(), path.clone());
+
+        // store reload function
+        self.write_functions
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| {
+                Box::new(|asset, path| {
+                    let typed = asset
+                        .as_any_mut()
+                        .downcast_mut::<T>()
+                        .expect("could not cast during write");
+                    typed.write(path);
+                })
+            });
+    }
+
+    //
+    // Render assets
+    //
+
+    pub fn convert<G: ConvertableRenderAsset>(
+        &mut self,
+        handle: AssetHandle<G::SourceAsset>,
+        params: &G::Params,
+    ) -> Option<ArcHandle<G>> {
+        // create new if not in cache
+        if !self
+            .render_cache
+            .contains_key(&handle.clone().clone_typed::<DynAsset>())
+        {
+            let asset = self.get(handle.clone());
+
+            if let Some(asset) = asset {
+                let converted = G::convert(asset, params);
+                self.render_cache.insert(
+                    handle.clone().clone_typed::<DynAsset>(),
+                    ArcHandle::new(converted).upcast(),
+                );
+            }
+        }
+
+        // get value and convert to G
+        self.render_cache
+            .get(&handle.clone_typed::<DynAsset>())
+            .map(|a| a.downcast::<G>())
+    }
+
+    //
+    // Polling
+    //
 
     // check if any files completed loading and update cache and invalidate render cache
     pub fn poll_loaded(&mut self) {
@@ -297,20 +345,18 @@ impl Assets {
         for path in self.reload_receiver.try_iter() {
             if let Some(handles) = self.reload_handles.get_mut(&path) {
                 for handle in handles {
-                    let asset = self.cache.get_mut(handle);
+                    println!("reload {:?}", path);
 
-                    if let Some(asset) = asset {
-                        println!("reload {:?}", path);
+                    // create/overwrite current value
+                    let loader_fn = self
+                        .reload_functions
+                        .get(&handle.ty_id)
+                        .expect("could not get loader fn");
+                    let asset = loader_fn(&path);
+                    self.cache.insert(handle.clone(), asset);
 
-                        let loader_fn = self
-                            .reload_functions
-                            .get(&handle.ty_id)
-                            .expect("could not get loader fn");
-                        *asset = loader_fn(&path);
-
-                        // invalidate render cache
-                        self.render_cache.remove(handle);
-                    }
+                    // invalidate render cache
+                    self.render_cache.remove(handle);
                 }
             }
         }
@@ -318,37 +364,6 @@ impl Assets {
 
     pub fn force_reload(&self, path: PathBuf) {
         self.reload_sender.send(path).expect("could not send path");
-    }
-
-    //
-    // Render assets
-    //
-
-    pub fn convert<G: ConvertableRenderAsset>(
-        &mut self,
-        handle: AssetHandle<G::SourceAsset>,
-        params: &G::Params,
-    ) -> Option<ArcHandle<G>> {
-        // create new if not in cache
-        if !self
-            .render_cache
-            .contains_key(&handle.clone().clone_typed::<DynAsset>())
-        {
-            let asset = self.get(handle.clone());
-
-            if let Some(asset) = asset {
-                let converted = G::convert(asset, params);
-                self.render_cache.insert(
-                    handle.clone().clone_typed::<DynAsset>(),
-                    ArcHandle::new(converted).upcast(),
-                );
-            }
-        }
-
-        // get value and convert to G
-        self.render_cache
-            .get(&handle.clone_typed::<DynAsset>())
-            .map(|a| a.downcast::<G>())
     }
 }
 

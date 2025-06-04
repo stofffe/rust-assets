@@ -14,7 +14,7 @@ fn main() {
         age: 12,
     });
     let person2 = assets.load_async::<Person>(Path::new("assets/alice.person"), true, true);
-    let shader = assets.load_sync::<Shader>(Path::new("assets/shader"), true, false);
+    let shader = assets.load_async::<Shader>(Path::new("assets/shader"), true, false);
 
     let mut i = 0;
     loop {
@@ -28,7 +28,9 @@ fn main() {
 
         println!("shader: {:?}", assets.get(shader.clone()));
         let gpu_shader = assets.convert(shader.clone(), &100);
-        print_gpu_shader(gpu_shader);
+        if let Some(gpu_shader) = gpu_shader {
+            print_gpu_shader(gpu_shader);
+        }
 
         if let Some(person) = assets.get(person2.clone()) {
             println!("person {:?}", person);

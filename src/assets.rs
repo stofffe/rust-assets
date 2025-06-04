@@ -34,7 +34,7 @@ pub trait ConvertableRenderAsset: RenderAsset + Send + Sync {
 }
 
 pub struct Assets {
-    cache: HashMap<AssetHandle<DynAsset>, Option<DynAsset>>, // TODO: does this need to be option with new function system
+    cache: HashMap<AssetHandle<DynAsset>, DynAsset>, // TODO: does this need to be option with new function system
     render_cache: HashMap<AssetHandle<DynAsset>, DynRenderAsset>,
 
     load_handles: HashMap<AssetHandle<DynAsset>, PathBuf>,
@@ -102,10 +102,8 @@ impl Assets {
 
     pub fn insert<T: Asset + 'static>(&mut self, data: T) -> AssetHandle<T> {
         let handle = AssetHandle::<T>::new();
-        self.cache.insert(
-            handle.clone().clone_typed::<DynAsset>(),
-            Some(Box::new(data)),
-        );
+        self.cache
+            .insert(handle.clone().clone_typed::<DynAsset>(), Box::new(data));
         handle
     }
 
@@ -115,9 +113,12 @@ impl Assets {
     pub fn get<T: Asset + 'static>(&mut self, handle: AssetHandle<T>) -> Option<&T> {
         self.cache
             .get(&handle.clone_typed::<DynAsset>())
-            .expect("invalid handle")
-            .as_ref()
-            .and_then(|asset| asset.as_any().downcast_ref::<T>())
+            .map(|asset| {
+                asset
+                    .as_any()
+                    .downcast_ref::<T>()
+                    .expect("could not downcast")
+            })
     }
 
     pub fn get_mut<T: Asset + 'static>(&mut self, handle: AssetHandle<T>) -> Option<&mut T> {
@@ -132,9 +133,12 @@ impl Assets {
         // get value and convert to T
         self.cache
             .get_mut(&handle.clone_typed::<DynAsset>())
-            .expect("invalid handle")
-            .as_mut()
-            .and_then(|asset| asset.as_any_mut().downcast_mut::<T>())
+            .map(|asset| {
+                asset
+                    .as_any_mut()
+                    .downcast_mut::<T>()
+                    .expect("could not downcast")
+            })
     }
 
     //
@@ -151,10 +155,8 @@ impl Assets {
 
         let data = T::load(&path);
         let handle = AssetHandle::<T>::new();
-        self.cache.insert(
-            handle.clone().clone_typed::<DynAsset>(),
-            Some(Box::new(data)),
-        );
+        self.cache
+            .insert(handle.clone().clone_typed::<DynAsset>(), Box::new(data));
 
         if watch {
             // start watching path
@@ -207,21 +209,17 @@ impl Assets {
         let path = fs::canonicalize(path).unwrap();
 
         let handle = AssetHandle::<T>::new();
-        self.cache
-            .insert(handle.clone().clone_typed::<DynAsset>(), None);
 
         let path_clone = path.clone();
         let handle_clone = handle.clone();
         let loaded_sender_clone = self.load_sender.clone();
 
         std::thread::spawn(move || {
-            println!("start async load");
-            std::thread::sleep(Duration::from_millis(2000));
+            std::thread::sleep(Duration::from_millis(2000)); // TODO: remove debug
             let data = T::load(&path_clone);
             loaded_sender_clone
                 .send((handle_clone.clone_typed::<DynAsset>(), Box::new(data)))
                 .expect("could not send");
-            println!("end async load");
         });
 
         if watch {
@@ -269,7 +267,7 @@ impl Assets {
     // check if any files completed loading and update cache and invalidate render cache
     pub fn poll_loaded(&mut self) {
         for (handle, asset) in self.load_receiver.try_iter() {
-            self.cache.insert(handle.clone(), Some(asset));
+            self.cache.insert(handle.clone(), asset);
             self.render_cache.remove(&handle);
         }
     }
@@ -277,7 +275,7 @@ impl Assets {
     pub fn poll_write(&mut self) {
         for handle in self.load_dirty.drain() {
             if let Some(path) = self.load_handles.get(&handle) {
-                let asset = self.cache.get_mut(&handle).expect("invalid handle");
+                let asset = self.cache.get_mut(&handle);
 
                 // write if loaded
                 if let Some(asset) = asset {
@@ -296,7 +294,7 @@ impl Assets {
     pub fn poll_reload(&mut self) {
         for path in self.reload_receiver.try_iter() {
             if let Some(handle) = self.reload_handles.get_mut(&path) {
-                let asset = self.cache.get_mut(handle).expect("invalid handle");
+                let asset = self.cache.get_mut(handle);
 
                 if let Some(asset) = asset {
                     println!("reload {:?}", path);
@@ -326,27 +324,27 @@ impl Assets {
         &mut self,
         handle: AssetHandle<G::SourceAsset>,
         params: &G::Params,
-    ) -> ArcHandle<G> {
+    ) -> Option<ArcHandle<G>> {
         // create new if not in cache
         if !self
             .render_cache
             .contains_key(&handle.clone().clone_typed::<DynAsset>())
         {
-            let asset = self.get(handle.clone()).expect("invalid handle"); // TODO: handle
-            let converted = G::convert(asset, params);
-            self.render_cache.insert(
-                handle.clone().clone_typed::<DynAsset>(),
-                ArcHandle::new(converted).upcast(),
-            );
+            let asset = self.get(handle.clone());
+
+            if let Some(asset) = asset {
+                let converted = G::convert(asset, params);
+                self.render_cache.insert(
+                    handle.clone().clone_typed::<DynAsset>(),
+                    ArcHandle::new(converted).upcast(),
+                );
+            }
         }
 
         // get value and convert to G
-        let any_handle = self
-            .render_cache
+        self.render_cache
             .get(&handle.clone_typed::<DynAsset>())
-            .unwrap();
-
-        any_handle.downcast::<G>()
+            .map(|a| a.downcast::<G>())
     }
 }
 
@@ -439,7 +437,11 @@ impl<T: Any + Send + Sync + 'static> ArcHandle<T> {
 impl ArcHandle<dyn Any + Sync + Send> {
     fn downcast<G: Send + Sync>(&self) -> ArcHandle<G> {
         ArcHandle {
-            handle: self.handle.clone().downcast::<G>().unwrap(),
+            handle: self
+                .handle
+                .clone()
+                .downcast::<G>()
+                .expect("could not downcast"),
             id: self.id,
         }
     }

@@ -11,7 +11,7 @@ pub struct AssetHandle<T: 'static> {
 
 impl<T: 'static> AssetHandle<T> {
     #![allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             ty: PhantomData,
@@ -19,20 +19,15 @@ impl<T: 'static> AssetHandle<T> {
     }
 
     #[inline]
-    pub fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> u64 {
         self.id
     }
-}
 
-impl<T: 'static> PartialOrd for AssetHandle<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.id.partial_cmp(&other.id)
-    }
-}
-
-impl<T: 'static> Ord for AssetHandle<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.id.cmp(&other.id)
+    pub(crate) fn clone_typed<G>(&self) -> AssetHandle<G> {
+        AssetHandle::<G> {
+            id: self.id,
+            ty: PhantomData,
+        }
     }
 }
 

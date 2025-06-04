@@ -1,5 +1,5 @@
-use assets::{Asset, Assets, ConvertableRenderAsset, RenderAsset};
-use std::{fmt::Write, fs::read_to_string, path::Path, thread::sleep, time::Duration};
+use assets::{ArcHandle, Asset, Assets, ConvertableRenderAsset, RenderAsset};
+use std::{fmt::Write, fs::read_to_string, path::Path, sync::Arc, thread::sleep, time::Duration};
 
 mod assets;
 mod handle;
@@ -28,20 +28,21 @@ fn main() {
         let gpu_shader = assets.convert(shader.clone(), &100);
         print_gpu_shader(gpu_shader);
 
-        if let Some(person) = assets.get_mut(person2.clone()) {
+        if let Some(person) = assets.get(person2.clone()) {
             println!("person {:?}", person);
         } else {
             println!("person not loaded");
         }
 
         assets.poll_reload();
+        assets.poll_write();
         assets.poll_loaded();
 
         i += 1;
     }
 }
 
-fn print_gpu_shader(shader: &GpuShader) {
+fn print_gpu_shader(shader: ArcHandle<GpuShader>) {
     println!("{:?}", shader)
 }
 

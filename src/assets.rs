@@ -1,15 +1,17 @@
 use crate::handle::AssetHandle;
+use std::any;
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::{
-    any::{Any, TypeId},
+    any::Any,
     collections::{HashMap, HashSet},
     fs,
-    marker::PhantomData,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::Duration,
 };
 
 pub type DynAsset = Box<dyn Asset>;
+pub type DynRenderAsset = ArcHandle<dyn Any + Send + Sync>;
 
 pub trait Asset: Any + Send + Sync {
     fn load(path: &Path) -> Self
@@ -25,7 +27,7 @@ pub trait Asset: Any + Send + Sync {
 }
 
 pub trait RenderAsset: Any {} // might be able to remove and enforce with convert function
-pub trait ConvertableRenderAsset: RenderAsset {
+pub trait ConvertableRenderAsset: RenderAsset + Send + Sync {
     type SourceAsset: Asset;
     type Params;
 
@@ -40,6 +42,8 @@ impl dyn Asset {
         self
     }
 }
+// impl Arc<dyn RenderAsset> {}
+
 impl dyn RenderAsset {
     fn as_any(&self) -> &dyn Any {
         self
@@ -48,24 +52,22 @@ impl dyn RenderAsset {
         self
     }
 }
-type AssetLoaderFn = fn(&Path) -> Box<dyn Asset>;
+
 pub struct Assets {
     cache: HashMap<AssetHandle<DynAsset>, Option<DynAsset>>,
-    render_cache: HashMap<AssetHandle<DynAsset>, Box<dyn RenderAsset>>,
+    render_cache: HashMap<AssetHandle<DynAsset>, DynRenderAsset>,
 
-    serialize_handles: HashMap<AssetHandle<DynAsset>, PathBuf>,
-    serialize_dirty: HashSet<AssetHandle<DynAsset>>,
-
-    deserialize_handles: HashMap<PathBuf, (AssetHandle<DynAsset>, AssetLoaderFn)>,
+    load_handles: HashMap<AssetHandle<DynAsset>, PathBuf>,
+    load_dirty: HashSet<AssetHandle<DynAsset>>,
+    // async loading
+    load_sender: mpsc::Sender<(AssetHandle<DynAsset>, DynAsset)>,
+    load_receiver: mpsc::Receiver<(AssetHandle<DynAsset>, DynAsset)>,
 
     // reloading
+    reload_handles: HashMap<PathBuf, AssetHandle<DynAsset>>,
     reload_watcher: notify_debouncer_mini::Debouncer<notify_debouncer_mini::notify::FsEventWatcher>,
     reload_receiver: mpsc::Receiver<PathBuf>,
     reload_sender: mpsc::Sender<PathBuf>,
-
-    // async loading
-    loaded_sender: mpsc::Sender<(AssetHandle<DynAsset>, DynAsset)>,
-    loaded_receiver: mpsc::Receiver<(AssetHandle<DynAsset>, DynAsset)>,
 }
 
 impl Assets {
@@ -93,16 +95,16 @@ impl Assets {
         Self {
             cache: HashMap::new(),
             render_cache: HashMap::new(),
-            serialize_dirty: HashSet::new(),
-            deserialize_handles: HashMap::new(),
-            serialize_handles: HashMap::new(),
+            load_dirty: HashSet::new(),
+            reload_handles: HashMap::new(),
+            load_handles: HashMap::new(),
 
             reload_receiver,
             reload_sender,
             reload_watcher,
 
-            loaded_sender,
-            loaded_receiver,
+            load_sender: loaded_sender,
+            load_receiver: loaded_receiver,
         }
     }
 
@@ -112,8 +114,10 @@ impl Assets {
 
     pub fn insert<T: Asset + 'static>(&mut self, data: T) -> AssetHandle<T> {
         let handle = AssetHandle::<T>::new();
-        self.cache
-            .insert(handle.clone().to_handle(), Some(Box::new(data)));
+        self.cache.insert(
+            handle.clone().clone_typed::<DynAsset>(),
+            Some(Box::new(data)),
+        );
         handle
     }
 
@@ -122,7 +126,7 @@ impl Assets {
     // could return error union [Ok, Invalid, Loading]
     pub fn get<T: Asset + 'static>(&mut self, handle: AssetHandle<T>) -> Option<&T> {
         self.cache
-            .get(&handle.to_handle())
+            .get(&handle.clone_typed::<DynAsset>())
             .expect("invalid handle")
             .as_ref()
             .and_then(|asset| asset.as_any().downcast_ref::<T>())
@@ -130,14 +134,16 @@ impl Assets {
 
     pub fn get_mut<T: Asset + 'static>(&mut self, handle: AssetHandle<T>) -> Option<&mut T> {
         // invalidate gpu cache
-        self.render_cache.remove(&handle.clone().to_handle());
+        self.render_cache
+            .remove(&handle.clone().clone_typed::<DynAsset>());
 
         // set dirty
-        self.serialize_dirty.insert(handle.clone().to_handle());
+        self.load_dirty
+            .insert(handle.clone().clone_typed::<DynAsset>());
 
         // get value and convert to T
         self.cache
-            .get_mut(&handle.to_handle())
+            .get_mut(&handle.clone_typed::<DynAsset>())
             .expect("invalid handle")
             .as_mut()
             .and_then(|asset| asset.as_any_mut().downcast_mut::<T>())
@@ -157,8 +163,10 @@ impl Assets {
 
         let data = T::load(&path);
         let handle = AssetHandle::<T>::new();
-        self.cache
-            .insert(handle.clone().to_handle(), Some(Box::new(data)));
+        self.cache.insert(
+            handle.clone().clone_typed::<DynAsset>(),
+            Some(Box::new(data)),
+        );
 
         if watch {
             self.reload_watcher
@@ -169,15 +177,13 @@ impl Assets {
                 )
                 .unwrap();
 
-            self.deserialize_handles.insert(
-                path.clone(),
-                (handle.clone().to_handle(), |p| Box::new(T::load(p))),
-            );
+            self.reload_handles
+                .insert(path.clone(), handle.clone().clone_typed::<DynAsset>());
         }
 
         if write {
-            self.serialize_handles
-                .insert(handle.clone().to_handle(), path.clone());
+            self.load_handles
+                .insert(handle.clone().clone_typed::<DynAsset>(), path.clone());
         }
 
         handle
@@ -192,18 +198,19 @@ impl Assets {
         let path = fs::canonicalize(path).unwrap();
 
         let handle = AssetHandle::<T>::new();
-        self.cache.insert(handle.clone().to_handle(), None);
+        self.cache
+            .insert(handle.clone().clone_typed::<DynAsset>(), None);
 
         let path_clone = path.clone();
         let handle_clone = handle.clone();
-        let loaded_sender_clone = self.loaded_sender.clone();
+        let loaded_sender_clone = self.load_sender.clone();
 
         std::thread::spawn(move || {
             println!("start async load");
             std::thread::sleep(Duration::from_millis(2000));
             let data = T::load(&path_clone);
             loaded_sender_clone
-                .send((handle_clone.to_handle(), Box::new(data)))
+                .send((handle_clone.clone_typed::<DynAsset>(), Box::new(data)))
                 .expect("could not send");
             println!("end async load");
         });
@@ -217,23 +224,29 @@ impl Assets {
                 )
                 .unwrap();
 
-            self.deserialize_handles.insert(
-                path.clone(),
-                (handle.clone().to_handle(), |p| Box::new(T::load(p))),
-            );
+            self.reload_handles
+                .insert(path.clone(), handle.clone().clone_typed::<DynAsset>());
         }
 
         if write {
-            self.serialize_handles
-                .insert(handle.clone().to_handle(), path.clone());
+            self.load_handles
+                .insert(handle.clone().clone_typed::<DynAsset>(), path.clone());
         }
 
         handle
     }
 
+    // check if any files completed loading and update cache and invalidate render cache
+    pub fn poll_loaded(&mut self) {
+        for (handle, asset) in self.load_receiver.try_iter() {
+            self.cache.insert(handle.clone(), Some(asset));
+            self.render_cache.remove(&handle);
+        }
+    }
+
     pub fn poll_write(&mut self) {
-        for handle in self.serialize_dirty.drain() {
-            if let Some(path) = self.serialize_handles.get(&handle) {
+        for handle in self.load_dirty.drain() {
+            if let Some(path) = self.load_handles.get(&handle) {
                 let asset = self.cache.get_mut(&handle).expect("invalid handle");
                 if let Some(asset) = asset {
                     asset.write(path);
@@ -246,41 +259,14 @@ impl Assets {
     // checks if any files changed and spawns a thread which reloads the data
     pub fn poll_reload(&mut self) {
         for path in self.reload_receiver.try_iter() {
-            let (handle, factory) = self.deserialize_handles.get_mut(&path).unwrap();
+            let handle = self.reload_handles.get_mut(&path).unwrap();
 
-            //
-            // SYNC
-            //
             let asset = self.cache.get_mut(handle).expect("invalid handle");
             if let Some(asset) = asset {
                 asset.reload(&path);
                 println!("load {:?}", path);
+                self.render_cache.remove(handle);
             }
-
-            //
-            // ASYNC
-            //
-
-            let handle_clone = handle.clone();
-            let path_clone = path.clone();
-            let sender_clone = self.loaded_sender.clone();
-            let factory_clone = factory.clone();
-            std::thread::spawn(move || {
-                // println!("reload start {:?}", path);
-                std::thread::sleep(Duration::from_millis(10000));
-                sender_clone
-                    .send((handle_clone, factory_clone(&path_clone)))
-                    .expect("could not send");
-                // println!("reload end {:?}", path);
-            });
-        }
-    }
-
-    // check if any files completed loading and update cache and invalidate render cache
-    pub fn poll_loaded(&mut self) {
-        for (handle, asset) in self.loaded_receiver.try_iter() {
-            self.cache.insert(handle.clone(), Some(asset));
-            self.render_cache.remove(&handle);
         }
     }
 
@@ -296,54 +282,104 @@ impl Assets {
         &mut self,
         handle: AssetHandle<G::SourceAsset>,
         params: &G::Params,
-    ) -> &G {
+    ) -> ArcHandle<G> {
         // create new if not in cache
-        if !self.render_cache.contains_key(&handle.clone().to_handle()) {
+        if !self
+            .render_cache
+            .contains_key(&handle.clone().clone_typed::<DynAsset>())
+        {
             let asset = self.get(handle.clone()).expect("invalid handle"); // TODO: handle
             let converted = G::convert(asset, params);
-            self.render_cache
-                .insert(handle.clone().to_handle(), Box::new(converted));
+            self.render_cache.insert(
+                handle.clone().clone_typed::<DynAsset>(),
+                ArcHandle::new(converted).upcast(),
+            );
         }
 
         // get value and convert to G
-        self.render_cache
-            .get(&handle.to_handle())
-            .and_then(|a| a.as_any().downcast_ref::<G>())
-            .unwrap()
-    }
+        let any_handle = self
+            .render_cache
+            .get(&handle.clone_typed::<DynAsset>())
+            .unwrap();
 
-    pub fn convert_mut<G: ConvertableRenderAsset>(
-        &mut self,
-        handle: AssetHandle<G::SourceAsset>,
-        params: &G::Params,
-    ) -> &mut G {
-        // create new if not in cache
-        if !self.render_cache.contains_key(&handle.clone().to_handle()) {
-            let asset = self.get_mut(handle.clone()).expect("invalid handle"); // TODO: hanlde
-            let converted = G::convert(asset, params);
-            self.render_cache
-                .insert(handle.clone().to_handle(), Box::new(converted));
-        }
-
-        // get value and convert to G
-        self.render_cache
-            .get_mut(&handle.to_handle())
-            .and_then(|a| a.as_any_mut().downcast_mut::<G>())
-            .unwrap()
+        any_handle.downcast::<G>()
     }
 }
 
-impl<T> AssetHandle<T> {
-    pub fn to_handle(self) -> AssetHandle<DynAsset> {
-        AssetHandle::<DynAsset> {
-            id: self.id,
-            ty: PhantomData,
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+pub struct ArcHandle<T: ?Sized + 'static> {
+    pub handle: Arc<T>,
+    id: u64,
+}
+
+impl<T: 'static> ArcHandle<T> {
+    pub fn new(handle: T) -> Self {
+        ArcHandle {
+            handle: Arc::new(handle),
+            id: NEXT_ID.fetch_add(1, SeqCst),
         }
     }
-    pub fn from_handle(any_handle: AssetHandle<DynAsset>) -> Self {
-        AssetHandle {
-            id: any_handle.id,
-            ty: PhantomData,
+
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl<T: 'static> Clone for ArcHandle<T> {
+    fn clone(&self) -> Self {
+        ArcHandle {
+            handle: Arc::clone(&self.handle),
+            id: self.id,
+        }
+    }
+}
+
+impl<T: 'static> PartialEq for ArcHandle<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl<T: 'static> Eq for ArcHandle<T> {}
+
+impl<T: 'static> std::hash::Hash for ArcHandle<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl<T: 'static> std::ops::Deref for ArcHandle<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.handle.as_ref()
+    }
+}
+
+impl<T: 'static> AsRef<T> for ArcHandle<T> {
+    fn as_ref(&self) -> &T {
+        self.handle.as_ref()
+    }
+}
+
+// any stuff
+
+impl<T: Any + Send + Sync + 'static> ArcHandle<T> {
+    pub fn upcast(self) -> ArcHandle<dyn Any + Send + Sync> {
+        ArcHandle {
+            handle: self.handle as Arc<dyn Any + Send + Sync>,
+            id: self.id,
+        }
+    }
+}
+impl ArcHandle<dyn Any + Sync + Send> {
+    fn downcast<G: Send + Sync>(&self) -> ArcHandle<G> {
+        ArcHandle {
+            handle: self.handle.clone().downcast::<G>().unwrap(),
+            id: self.id,
         }
     }
 }

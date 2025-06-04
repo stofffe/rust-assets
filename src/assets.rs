@@ -34,7 +34,7 @@ pub trait ConvertableRenderAsset: RenderAsset + Send + Sync {
 }
 
 pub struct Assets {
-    cache: HashMap<AssetHandle<DynAsset>, DynAsset>, // TODO: does this need to be option with new function system
+    cache: HashMap<AssetHandle<DynAsset>, DynAsset>,
     render_cache: HashMap<AssetHandle<DynAsset>, DynRenderAsset>,
 
     load_handles: HashMap<AssetHandle<DynAsset>, PathBuf>,
@@ -46,7 +46,7 @@ pub struct Assets {
 
     // reloading
     reload_functions: HashMap<TypeId, DynAssetLoadFn>,
-    reload_handles: HashMap<PathBuf, AssetHandle<DynAsset>>, // TODO: support multiple assets with same path
+    reload_handles: HashMap<PathBuf, Vec<AssetHandle<DynAsset>>>, // TODO: support multiple assets with same path
     reload_watcher: notify_debouncer_mini::Debouncer<notify_debouncer_mini::notify::FsEventWatcher>,
     reload_receiver: mpsc::Receiver<PathBuf>,
     reload_sender: mpsc::Sender<PathBuf>,
@@ -169,8 +169,9 @@ impl Assets {
                 .unwrap();
 
             // map path to handle
-            self.reload_handles
-                .insert(path.clone(), handle.clone().clone_typed::<DynAsset>());
+
+            let handles = self.reload_handles.entry(path.clone()).or_default();
+            handles.push(handle.clone().clone_typed::<DynAsset>());
 
             // store reload function
             self.reload_functions
@@ -233,8 +234,8 @@ impl Assets {
                 .unwrap();
 
             // map path to handle
-            self.reload_handles
-                .insert(path.clone(), handle.clone().clone_typed::<DynAsset>());
+            let handles = self.reload_handles.entry(path.clone()).or_default();
+            handles.push(handle.clone().clone_typed::<DynAsset>());
 
             // store reload function
             self.reload_functions
@@ -272,6 +273,7 @@ impl Assets {
         }
     }
 
+    // check if any files are scheduled for writing to disk
     pub fn poll_write(&mut self) {
         for handle in self.load_dirty.drain() {
             if let Some(path) = self.load_handles.get(&handle) {
@@ -293,20 +295,22 @@ impl Assets {
     // checks if any files changed and spawns a thread which reloads the data
     pub fn poll_reload(&mut self) {
         for path in self.reload_receiver.try_iter() {
-            if let Some(handle) = self.reload_handles.get_mut(&path) {
-                let asset = self.cache.get_mut(handle);
+            if let Some(handles) = self.reload_handles.get_mut(&path) {
+                for handle in handles {
+                    let asset = self.cache.get_mut(handle);
 
-                if let Some(asset) = asset {
-                    println!("reload {:?}", path);
+                    if let Some(asset) = asset {
+                        println!("reload {:?}", path);
 
-                    let loader_fn = self
-                        .reload_functions
-                        .get(&handle.ty_id)
-                        .expect("could not get loader fn");
-                    *asset = loader_fn(&path);
+                        let loader_fn = self
+                            .reload_functions
+                            .get(&handle.ty_id)
+                            .expect("could not get loader fn");
+                        *asset = loader_fn(&path);
 
-                    // invalidate render cache
-                    self.render_cache.remove(handle);
+                        // invalidate render cache
+                        self.render_cache.remove(handle);
+                    }
                 }
             }
         }

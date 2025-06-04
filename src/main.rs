@@ -14,6 +14,7 @@ fn main() {
         age: 12,
     });
     let person2 = assets.load_async::<Person>(Path::new("assets/alice.person"), true, true);
+    let person3 = assets.load_async::<Person>(Path::new("assets/shader"), true, false);
     let shader = assets.load_async::<Shader>(Path::new("assets/shader"), true, false);
 
     let mut i = 0;
@@ -33,6 +34,11 @@ fn main() {
         }
 
         if let Some(person) = assets.get(person2.clone()) {
+            println!("person {:?}", person);
+        } else {
+            println!("person not loaded");
+        }
+        if let Some(person) = assets.get(person3.clone()) {
             println!("person {:?}", person);
         } else {
             println!("person not loaded");
@@ -106,9 +112,6 @@ impl ConvertableRenderAsset for GpuShader {
 
     fn convert(source: &Self::SourceAsset, params: &Self::Params) -> Self {
         println!("convert shader to gpu shader");
-        let id = source.source.trim().parse::<u32>().unwrap();
-        Self {
-            module: id + *params,
-        }
+        Self { module: 0 }
     }
 }

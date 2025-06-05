@@ -13,9 +13,10 @@ fn main() {
         name: String::from("bro"),
         age: 12,
     });
-    let person2 = assets.load_async::<Person>(Path::new("assets/alice.person"), true, true);
-    let person3 = assets.load_async::<Person>(Path::new("assets/shader"), true, false);
-    let shader = assets.load_async::<Shader>(Path::new("assets/shader"), true, false);
+    let person2 = assets.load_watch_write::<Person>(Path::new("assets/alice.person"), true);
+
+    let person3 = assets.load::<Person>(Path::new("assets/shader"), true);
+    let shader = assets.load::<Shader>(Path::new("assets/shader"), true);
 
     let mut i = 0;
     loop {

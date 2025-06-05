@@ -1,4 +1,4 @@
-use std::{any::TypeId, marker::PhantomData, sync::atomic::AtomicU64};
+use std::{any::TypeId, marker::PhantomData, path::PathBuf, sync::atomic::AtomicU64};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -6,8 +6,9 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub struct AssetHandle<T: 'static> {
     pub(crate) id: u64,
-    pub(crate) ty: PhantomData<T>,
     pub(crate) ty_id: TypeId,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) ty: PhantomData<T>,
 }
 
 impl<T: 'static> AssetHandle<T> {
@@ -15,8 +16,9 @@ impl<T: 'static> AssetHandle<T> {
     pub(crate) fn new() -> Self {
         Self {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-            ty: PhantomData,
             ty_id: TypeId::of::<T>(),
+            path: None,
+            ty: PhantomData,
         }
     }
 
@@ -30,6 +32,7 @@ impl<T: 'static> AssetHandle<T> {
             id: self.id,
             ty: PhantomData,
             ty_id: TypeId::of::<T>(),
+            path: self.path.clone(), // TODO:
         }
     }
 }
@@ -54,6 +57,7 @@ impl<T: 'static> Clone for AssetHandle<T> {
             id: self.id,
             ty: PhantomData,
             ty_id: TypeId::of::<T>(),
+            path: self.path.clone(), // TODO:
         }
     }
 }

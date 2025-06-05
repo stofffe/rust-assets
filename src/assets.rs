@@ -46,7 +46,7 @@ pub struct Assets {
 
     // reloading
     reload_functions: HashMap<TypeId, DynAssetLoadFn>,
-    reload_handles: HashMap<PathBuf, Vec<AssetHandle<DynAsset>>>, // TODO: support multiple assets with same path
+    reload_handles: HashMap<PathBuf, Vec<AssetHandle<DynAsset>>>,
     reload_watcher: notify_debouncer_mini::Debouncer<notify_debouncer_mini::notify::FsEventWatcher>,
     reload_receiver: mpsc::Receiver<PathBuf>,
     reload_sender: mpsc::Sender<PathBuf>,
@@ -145,13 +145,10 @@ impl Assets {
     // Reloading
     //
 
-    pub fn load<T: Asset + LoadableAsset + WriteableAsset>(
-        &mut self,
-        path: &Path,
-        watch: bool,
-        write: bool,
-        sync: bool,
-    ) -> AssetHandle<T> {
+    // TODO: investigate using watch and write manually main, maybe store path in asset handle also
+
+    /// Load a file
+    pub fn load<T: Asset + LoadableAsset>(&mut self, path: &Path, sync: bool) -> AssetHandle<T> {
         let path = fs::canonicalize(path).unwrap();
         let handle = AssetHandle::<T>::new();
 
@@ -172,75 +169,53 @@ impl Assets {
             });
         }
 
-        if watch {
-            self.watch(handle.clone(), path.clone());
-        }
-
-        if write {
-            self.write(handle.clone(), path.clone());
-        }
-
         handle
     }
 
-    pub fn load_sync<T: Asset + LoadableAsset + WriteableAsset>(
+    /// Load a file
+    ///
+    /// Register asset for being watched for hot reloads
+    pub fn load_watch<T: Asset + LoadableAsset>(
         &mut self,
         path: &Path,
-        watch: bool,
-        write: bool,
+        sync: bool,
     ) -> AssetHandle<T> {
-        let path = fs::canonicalize(path).unwrap();
-
-        let data = T::load(&path);
-        let handle = AssetHandle::<T>::new();
-        self.cache
-            .insert(handle.clone().clone_typed::<DynAsset>(), Box::new(data));
-
-        if watch {
-            self.watch(handle.clone(), path.clone());
-        }
-
-        if write {
-            self.write(handle.clone(), path.clone());
-        }
-
+        let handle = self.load(path, sync);
+        self.watch(handle.clone(), path);
         handle
     }
 
-    pub fn load_async<T: Asset + LoadableAsset + WriteableAsset>(
+    /// Load a file
+    ///
+    /// Register asset for being written to disk when updated
+    pub fn load_write<T: Asset + LoadableAsset + WriteableAsset>(
         &mut self,
         path: &Path,
-        watch: bool,
-        write: bool,
+        sync: bool,
     ) -> AssetHandle<T> {
-        let path = fs::canonicalize(path).unwrap();
-
-        let handle = AssetHandle::<T>::new();
-
-        let path_clone = path.clone();
-        let handle_clone = handle.clone();
-        let loaded_sender_clone = self.load_sender.clone();
-
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(5000)); // TODO: remove debug
-            let data = T::load(&path_clone);
-            loaded_sender_clone
-                .send((handle_clone.clone_typed::<DynAsset>(), Box::new(data)))
-                .expect("could not send");
-        });
-
-        if watch {
-            self.watch(handle.clone(), path.clone());
-        }
-
-        if write {
-            self.write(handle.clone(), path.clone());
-        }
-
+        let handle = self.load(path, sync);
+        self.write(handle.clone(), path);
+        handle
+    }
+    /// Load a file
+    ///
+    /// Register asset for being watched for hot reloads
+    /// Register asset for being written to disk when updated
+    pub fn load_watch_write<T: Asset + LoadableAsset + WriteableAsset>(
+        &mut self,
+        path: &Path,
+        sync: bool,
+    ) -> AssetHandle<T> {
+        let handle = self.load(path, sync);
+        self.watch(handle.clone(), path);
+        self.write(handle.clone(), path);
         handle
     }
 
-    fn watch<T: Asset + LoadableAsset>(&mut self, handle: AssetHandle<T>, path: PathBuf) {
+    /// Register asset for being watched for hot reloads
+    pub fn watch<T: Asset + LoadableAsset>(&mut self, handle: AssetHandle<T>, path: &Path) {
+        let path = fs::canonicalize(path).unwrap();
+
         // start watching path
         self.reload_watcher
             .watcher()
@@ -259,7 +234,10 @@ impl Assets {
             .entry(TypeId::of::<T>())
             .or_insert_with(|| Box::new(|path| Box::new(T::load(path))));
     }
-    fn write<T: Asset + WriteableAsset>(&mut self, handle: AssetHandle<T>, path: PathBuf) {
+
+    /// Register asset for being written to disk when updated
+    pub fn write<T: Asset + WriteableAsset>(&mut self, handle: AssetHandle<T>, path: &Path) {
+        let path = fs::canonicalize(path).unwrap();
         // map handle to path
         self.load_handles
             .insert(handle.clone_typed::<DynAsset>(), path.clone());
